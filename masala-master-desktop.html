@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>🌶️ Masala Master — Desktop POS & Admin</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%}
+body{font-family:'DM Sans',sans-serif;background:#F7F5F0;color:#1A1208}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ════════════════════════════════════════════════════════════
+//  SYNC ENGINE v3 — Production Real-Time Firebase Sync
+//  Architecture:
+//   • Firebase RTDB as single source of truth (cross-device)
+//   • BroadcastChannel as zero-latency same-browser fallback
+//   • localStorage as offline cache / cold-start seed
+//   • Dedicated "orders" node for instant iPhone→Desktop delivery
+//   • Dedup via sale ID Set — never duplicate orders
+//   • Auto reconnect on network restore
+//   • Offline queue with auto-flush on reconnect
+// ════════════════════════════════════════════════════════════
+
+const STORE_KEY   = "masalamaster_db";
+const SYNC_CH     = "masalamaster_sync_v3";
+const DEVICE_ID   = "desktop_" + (localStorage.getItem("mm_did") || (()=>{ const id=Math.random().toString(36).slice(2,8); localStorage.setItem("mm_did",id); return id; })());
+const ORDERS_PATH = "masalamaster/orders";
+const DB_PATH     = "masalamaster/db";
+const VERSION     = 3;
+
+// ── Local DB Helpers ──
+function getLocalDB() {
+  try { const r = localStorage.getItem(STORE_KEY); if (r) return JSON.parse(r); } catch {}
+  return null;
+}
+function saveLocalDB(db) {
+  db._lastUpdated = Date.now();
+  db._lastDevice  = DEVICE_ID;
+  db._version     = VERSION;
+  localStorage.setItem(STORE_KEY, JSON.stringify(db));
+}
+
+// ── Firebase Engine ──
+// Holds singleton Firebase state outside React
+const FB = {
+  app: null,
+  db: null,
+  listeners: {},
+  initialized: false,
+  configHash: null,
+};
+
+function hashConfig(str) { let h=0; for(let i=0;i<str.length;i++) h=(h<<5)-h+str.charCodeAt(i)|0; return h; }
+
+function initFirebase(configStr, callbacks) {
+  if (!configStr?.trim()) return false;
+  try {
+    const config = JSON.parse(configStr);
+    if (!config.apiKey || !config.databaseURL) return false;
+
+    const ch = hashConfig(configStr);
+    if (FB.initialized && FB.configHash === ch) {
+      // Already initialized with same config — just re-attach listeners
+      if (callbacks) attachListeners(callbacks);
+      return true;
+    }
+
+    const doInit = () => {
+      try {
+        if (!window.firebase) return false;
+        // Clean up old app if config changed
+        if (FB.app && FB.configHash !== ch) {
+          try { FB.app.delete(); } catch {}
+          FB.app = null; FB.db = null; FB.initialized = false;
+        }
+        if (!FB.app) {
+          // Check for existing firebase app
+          if (firebase.apps && firebase.apps.length > 0) {
+            FB.app = firebase.apps[0];
+          } else {
+            FB.app = firebase.initializeApp(config);
+          }
+        }
+        FB.db = firebase.database();
+        FB.initialized = true;
+        FB.configHash = ch;
+        if (callbacks) attachListeners(callbacks);
+        return true;
+      } catch(e) { console.warn("[Sync] Firebase init error:", e); return false; }
+    };
+
+    if (window.firebase && window.firebase.database) {
+      return doInit();
+    }
+
+    // Load SDK dynamically
+    const urls = [
+      "https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js",
+      "https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js",
+    ];
+    let loaded = 0;
+    urls.forEach(url => {
+      if (document.querySelector(`script[src="${url}"]`)) { if(++loaded===urls.length) doInit(); return; }
+      const s = document.createElement("script");
+      s.src = url;
+      s.onload = () => { if (++loaded === urls.length) doInit(); };
+      s.onerror = () => console.warn("[Sync] Failed to load Firebase SDK");
+      document.head.appendChild(s);
+    });
+    return true;
+  } catch(e) { console.warn("[Sync] Firebase config parse error:", e); return false; }
+}
+
+function attachListeners(callbacks) {
+  if (!FB.db) return;
+  // Detach old listeners first to avoid duplicates
+  detachListeners();
+
+  // Listen to new orders node (iPhone orders come in here instantly)
+  FB.listeners.orders = FB.db.ref(ORDERS_PATH).on("child_added", snap => {
+    const order = snap.val();
+    if (order && order._device !== DEVICE_ID) {
+      callbacks.onNewOrder(order, snap.key);
+    }
+  }, err => console.warn("[Sync] Orders listener error:", err));
+
+  // Listen to full DB node (products, settings changes from iPhone)
+  FB.listeners.db = FB.db.ref(DB_PATH).on("value", snap => {
+    const remote = snap.val();
+    if (remote && remote._lastDevice !== DEVICE_ID) {
+      callbacks.onRemoteDB(remote);
+    }
+  }, err => console.warn("[Sync] DB listener error:", err));
+
+  // Connection state
+  FB.listeners.connRef = FB.db.ref(".info/connected");
+  FB.listeners.connRef.on("value", snap => {
+    callbacks.onConnected(snap.val() === true);
+  });
+}
+
+function detachListeners() {
+  if (!FB.db) return;
+  try {
+    if (FB.listeners.orders) FB.db.ref(ORDERS_PATH).off("child_added", FB.listeners.orders);
+    if (FB.listeners.db)     FB.db.ref(DB_PATH).off("value", FB.listeners.db);
+    if (FB.listeners.connRef) FB.listeners.connRef.off("value");
+  } catch {}
+  FB.listeners = {};
+}
+
+function fbPushDB(db) {
+  if (!FB.db) return;
+  try { FB.db.ref(DB_PATH).set(db); } catch(e) { console.warn("[Sync] Push DB error:", e); }
+}
+
+function fbAckOrder(key) {
+  // Move order from /orders to /orders_acked to prevent re-delivery
+  // (Desktop deletes after processing)
+  if (!FB.db || !key) return;
+  try { FB.db.ref(`${ORDERS_PATH}/${key}`).remove(); } catch {}
+}
+
+// ── Default Data ──
+const defaultProducts = [
+  { id:"p1", code:"1001", barcode:"8901030838874", name:"Basmati Rice 5kg",        category:"Grains", price:450, cost:320, stock:48, unit:"Bag",    supplier:"AgriCo",     tax:5,  image:"🍚" },
+  { id:"p2", code:"1002", barcode:"8906007310016", name:"Toor Dal 1kg",            category:"Pulses", price:120, cost:90,  stock:72, unit:"Kg",     supplier:"PulseWorld", tax:5,  image:"🫘" },
+  { id:"p3", code:"1003", barcode:"8901063152298", name:"Amul Butter 500g",        category:"Dairy",  price:230, cost:195, stock:24, unit:"Pack",   supplier:"Amul",       tax:12, image:"🧈" },
+  { id:"p4", code:"1004", barcode:"8906003721014", name:"MDH Garam Masala 100g",   category:"Spices", price:85,  cost:58,  stock:60, unit:"Box",    supplier:"MDH",        tax:5,  image:"🌶️"},
+  { id:"p5", code:"1005", barcode:"8901030592766", name:"Sunflower Oil 1L",        category:"Oils",   price:155, cost:118, stock:36, unit:"Bottle", supplier:"Fortune",    tax:5,  image:"🫙" },
+  { id:"p6", code:"1006", barcode:"8906013440010", name:"Parle-G Biscuits 400g",   category:"Snacks", price:40,  cost:28,  stock:5,  unit:"Pack",   supplier:"Parle",      tax:18, image:"🍪" },
+  { id:"p7", code:"1007", barcode:"8901063141100", name:"Amul Milk 1L",            category:"Dairy",  price:62,  cost:55,  stock:0,  unit:"Pouch",  supplier:"Amul",       tax:0,  image:"🥛" },
+  { id:"p8", code:"1008", barcode:"8906003430011", name:"Catch Black Pepper 100g", category:"Spices", price:65,  cost:42,  stock:30, unit:"Box",    supplier:"Catch",      tax:5,  image:"🫙" },
+];
+const defaultSales = [
+  { id:"s1", date:new Date(Date.now()-3600000).toISOString(),    items:[{name:"Basmati Rice 5kg",qty:2,price:450},{name:"Toor Dal 1kg",qty:3,price:120}],         total:1260, cashier:"Admin", payMethod:"cash",   paid:1300, change:40, source:"desktop" },
+  { id:"s2", date:new Date(Date.now()-7200000).toISOString(),    items:[{name:"Amul Butter 500g",qty:1,price:230},{name:"MDH Garam Masala 100g",qty:2,price:85}],  total:400,  cashier:"Admin", payMethod:"card",   paid:400,  change:0,  source:"desktop" },
+  { id:"s3", date:new Date(Date.now()-86400000).toISOString(),   items:[{name:"Sunflower Oil 1L",qty:4,price:155}],                                                total:620,  cashier:"Admin", payMethod:"cash",   paid:700,  change:80, source:"desktop" },
+  { id:"s4", date:new Date(Date.now()-86400000*2).toISOString(), items:[{name:"Parle-G Biscuits 400g",qty:6,price:40},{name:"Amul Milk 1L",qty:5,price:62}],       total:550,  cashier:"Admin", payMethod:"online", paid:550,  change:0,  source:"iphone"  },
+];
+function initDB() {
+  const ex = getLocalDB();
+  if (ex) return ex;
+  const db = {
+    products: defaultProducts,
+    sales: defaultSales,
+    settings: {
+      storeName:"Masala Master", cashier:"Admin", currency:"₹",
+      address:"123 Spice Lane, Mumbai", phone:"+91 98765 43210",
+      gstin:"27AADCM8628F1Z1", firebaseConfig:"",
+      thermalWidth:"58mm", autoOpenOrders:true,
+    }
+  };
+  saveLocalDB(db);
+  return db;
+}
+
+// ── Icons ──
+const I = ({ n, s=18 }) => {
+  const ic = {
+    dashboard: <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>,
+    inventory:  <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>,
+    sales:      <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>,
+    analytics:  <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>,
+    settings:   <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+    plus:       <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+    edit:       <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+    trash:      <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>,
+    print:      <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>,
+    search:     <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
+    x:          <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+    check:      <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>,
+    trending:   <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>,
+    package:    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16.5 9.4l-9-5.19"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>,
+    receipt:    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1-2-1z"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="12" y2="16"/></svg>,
+    phone:      <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.61 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 9.91a16 16 0 0 0 6.07 6.07l.95-.95a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/></svg>,
+    sync:       <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>,
+    void:       <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>,
+    filter:     <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>,
+    download:   <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+    barcode:    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 5v14"/><path d="M8 5v14"/><path d="M12 5v14"/><path d="M17 5v14"/><path d="M21 5v14"/></svg>,
+    wifi:       <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>,
+  };
+  return ic[n] || null;
+};
+
+// ── CSS ──
+const css = `
+:root{--bg:#F7F5F0;--surface:#FFFFFF;--border:#E8E4DC;--text:#1A1208;--text2:#6B6455;--accent:#C8392B;--success:#2B7A3D;--warn:#E8A020;--sidebar:#1A1208;--r:12px;--sh:0 2px 12px rgba(26,18,8,.08);--shl:0 8px 32px rgba(26,18,8,.12)}
+body{background:var(--bg);min-height:100vh}
+.app{display:flex;height:100vh;overflow:hidden}
+.sidebar{width:230px;background:var(--sidebar);color:#F7F5F0;display:flex;flex-direction:column;flex-shrink:0}
+.sl{padding:24px 20px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.sl h1{font-family:'Syne',sans-serif;font-size:17px;font-weight:800;color:#fff;letter-spacing:-.5px;margin-bottom:2px}
+.sl small{font-size:10px;color:#6B5D4A;font-weight:600;letter-spacing:1.5px;text-transform:uppercase}
+.sync-pill{display:inline-flex;align-items:center;gap:6px;margin-top:10px;padding:5px 10px;border-radius:20px;font-size:11px;font-weight:700;background:rgba(255,255,255,.07);cursor:pointer;transition:background .15s;width:100%}
+.sync-pill:hover{background:rgba(255,255,255,.13)}
+.sdot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.sdot.connected{background:#22C55E;animation:pulse 3s infinite}
+.sdot.syncing{background:#E8A020;animation:pulse .7s infinite}
+.sdot.error{background:#C8392B}
+.sdot.offline{background:#6B7280}
+.sdot.idle{background:#6B7280}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.snav{flex:1;padding:12px 10px;display:flex;flex-direction:column;gap:1px;overflow-y:auto}
+.nsec{font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#4B3E2F;padding:12px 10px 5px}
+.ni{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;cursor:pointer;transition:all .12s;color:rgba(247,245,240,.6);font-size:13.5px;font-weight:500;user-select:none}
+.ni:hover{background:rgba(255,255,255,.07);color:#fff}
+.ni.active{background:#C8392B;color:#fff;font-weight:600}
+.nbadge{margin-left:auto;background:#E8A020;color:#fff;font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;min-width:20px;text-align:center}
+.nbadge.new{background:#C8392B;animation:nbounce .5s ease}
+@keyframes nbounce{0%{transform:scale(0)}70%{transform:scale(1.2)}100%{transform:scale(1)}}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+.topbar{background:#fff;border-bottom:1px solid var(--border);padding:0 24px;height:60px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;gap:12px}
+.tt{font-family:'Syne',sans-serif;font-size:19px;font-weight:700;white-space:nowrap}
+.content{flex:1;overflow-y:auto;padding:24px}
+.card{background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:22px;box-shadow:var(--sh)}
+.sgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+.sc{background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;position:relative;overflow:hidden;transition:box-shadow .15s}
+.sc:hover{box-shadow:var(--shl)}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:var(--ac,var(--accent))}
+.slabel{font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px}
+.sval{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--text);line-height:1.1}
+.ssub{font-size:12px;color:var(--text2);margin-top:5px}
+.sico{position:absolute;right:16px;top:16px;opacity:.07}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13.5px;font-weight:600;cursor:pointer;border:none;transition:all .12s;white-space:nowrap}
+.bp{background:var(--accent);color:#fff}
+.bp:hover{background:#a82e22;transform:translateY(-1px);box-shadow:0 4px 12px rgba(200,57,43,.3)}
+.bs{background:var(--bg);border:1px solid var(--border);color:var(--text)}
+.bs:hover{background:var(--border)}
+.bsm{padding:5px 11px;font-size:12.5px}
+.bi{padding:7px;border-radius:7px;background:var(--bg);border:1px solid var(--border);cursor:pointer;display:inline-flex;align-items:center;color:var(--text2);transition:all .12s}
+.bi:hover{color:var(--accent);border-color:var(--accent);background:#FFF0EE}
+.bd{background:#FEF2F2;color:var(--accent);border:1px solid #FECACA}
+.bd:hover{background:#FEE2E2}
+.bw{background:#FFFBEB;color:var(--warn);border:1px solid #FEF3C7}
+.bw:hover{background:#FEF3C7}
+.tw{border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{background:var(--bg);font-size:11.5px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
+td{padding:11px 14px;font-size:13.5px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(200,57,43,.015)}
+.badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:20px;font-size:11.5px;font-weight:700}
+.bg{background:#DCFCE7;color:#166534}.br{background:#FEF2F2;color:#991B1B}.by{background:#FEFCE8;color:#854D0E}.bb{background:#EFF6FF;color:#1E40AF}.bp_{background:#F5F3FF;color:#5B21B6}
+.mo{position:fixed;inset:0;background:rgba(26,18,8,.55);z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;animation:fi .15s}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+.md{background:#fff;border-radius:16px;width:100%;max-width:660px;max-height:90vh;overflow-y:auto;box-shadow:var(--shl);animation:su .2s}
+@keyframes su{from{transform:translateY(16px);opacity:0}to{transform:translateY(0);opacity:1}}
+.mh{display:flex;align-items:center;justify-content:space-between;padding:22px 26px 0}
+.mh h2{font-family:'Syne',sans-serif;font-size:19px;font-weight:700}
+.mb{padding:20px 26px}
+.mf{padding:0 26px 22px;display:flex;gap:10px;justify-content:flex-end}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.fgg{display:flex;flex-direction:column;gap:5px}
+.fgg.full{grid-column:1/-1}
+label{font-size:12.5px;font-weight:600;color:var(--text2)}
+input,select,textarea{width:100%;padding:9px 13px;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13.5px;color:var(--text);background:#fff;transition:border-color .12s;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(200,57,43,.08)}
+.iw{position:relative}.ii{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--text2);pointer-events:none}.iw input{padding-left:38px}
+.rp{font-family:'Courier New',monospace;font-size:12px;background:#fff;border:1px dashed #ccc;border-radius:8px;padding:20px;max-width:320px;margin:0 auto;line-height:1.6}
+.rp hr{border:none;border-top:1px dashed #ccc;margin:8px 0}
+.cbw{display:flex;align-items:flex-end;gap:3px;height:100px;margin-top:8px}
+.cb{flex:1;border-radius:4px 4px 0 0;transition:all .3s;cursor:pointer;min-width:16px;position:relative}
+.cb:hover::after{content:attr(data-tip);position:absolute;bottom:calc(100%+4px);left:50%;transform:translateX(-50%);background:#1A1208;color:#fff;font-size:11px;padding:3px 8px;border-radius:4px;white-space:nowrap;pointer-events:none}
+.cbl{font-size:10px;color:var(--text2);text-align:center;margin-top:4px;white-space:nowrap}
+.tag{display:inline-flex;align-items:center;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:var(--bg);color:var(--text2);border:1px solid var(--border);font-family:monospace}
+.row{display:flex;gap:18px;margin-bottom:20px}
+.c2{flex:2}.c1{flex:1}
+.sh{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.sh h2{font-family:'Syne',sans-serif;font-size:16px;font-weight:700}
+.divider{height:1px;background:var(--border);margin:14px 0}
+.toast{position:fixed;bottom:24px;right:24px;padding:13px 18px;border-radius:10px;font-size:13.5px;font-weight:500;z-index:9999;animation:su .2s;display:flex;align-items:center;gap:10px;box-shadow:var(--shl);max-width:360px}
+.toast.success{background:var(--success);color:#fff}
+.toast.error{background:var(--accent);color:#fff}
+.toast.warn{background:var(--warn);color:#fff}
+.toast.info{background:var(--text);color:#fff}
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#D1C9BC;border-radius:3px}
+@media print{.np{display:none!important}.print-only{display:block!important}}
+.print-only{display:none}
+.void-tag{background:#FEF2F2;color:#991B1B;border:1px solid #FECACA;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;text-decoration:line-through}
+.new-order-banner{background:linear-gradient(135deg,#C8392B,#A82E22);color:#fff;padding:14px 20px;border-radius:12px;display:flex;align-items:center;gap:14px;margin-bottom:20px;animation:glow 1.5s ease infinite}
+@keyframes glow{0%,100%{box-shadow:0 4px 16px rgba(200,57,43,.3)}50%{box-shadow:0 4px 28px rgba(200,57,43,.7)}}
+.prog{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-top:8px}
+.prog-bar{height:100%;border-radius:3px;transition:width .5s}
+.setup-banner{background:linear-gradient(135deg,#1A56DB15,#1A56DB08);border:1.5px solid #1A56DB30;border-radius:12px;padding:16px 20px;margin-bottom:20px}
+`;
+
+// ── Helpers ──
+function fmtDate(iso) { return new Date(iso).toLocaleString("en-IN",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}); }
+function fmtDateShort(iso) { return new Date(iso).toLocaleString("en-IN",{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"}); }
+function today() { return new Date().toDateString(); }
+function getProfit(sale, products) {
+  return sale.items.reduce((a,it) => {
+    const p = products?.find(pp=>pp.name===it.name);
+    return a + (it.price - (p?.cost||it.price*.75)) * it.qty;
+  }, 0);
+}
+
+// ── Toast ──
+function Toast({ msg, type, onClose }) {
+  useEffect(() => { const t = setTimeout(onClose, 4500); return ()=>clearTimeout(t); }, []);
+  const icons = { success:"✓", error:"✕", warn:"⚠", info:"ℹ" };
+  return <div className={`toast ${type}`}>{icons[type]||"•"} {msg}</div>;
+}
+
+// ── Stat Card ──
+function SC({ label, value, sub, icon, color }) {
+  return (
+    <div className="sc" style={{"--ac": color}}>
+      <div className="sico" style={{fontSize:44,color}}>{icon}</div>
+      <div className="slabel">{label}</div>
+      <div className="sval">{value}</div>
+      {sub && <div className="ssub">{sub}</div>}
+    </div>
+  );
+}
+
+// ── Print Receipt ──
+function buildReceiptHTML(sale, settings, cur) {
+  const payIcon = { cash:"💵", card:"💳", online:"📱" };
+  return `<!DOCTYPE html><html><head><title>Receipt</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Courier New',monospace;font-size:12px;color:#000;width:${settings.thermalWidth||"58mm"};margin:0 auto;padding:8px}
+.c{text-align:center}.r{display:flex;justify-content:space-between;margin:2px 0}.b{font-weight:bold}
+hr{border:none;border-top:1px dashed #999;margin:6px 0}h2{font-size:15px;font-weight:bold;margin-bottom:2px}
+</style></head><body>
+<div class="c"><h2>${settings.storeName}</h2><div>${settings.address}</div><div>Tel: ${settings.phone}</div><div>GSTIN: ${settings.gstin}</div></div>
+<hr/>
+<div>Date: ${new Date(sale.date).toLocaleString("en-IN")}</div>
+<div>Cashier: ${sale.cashier}</div>
+<div>Order #${sale.id.slice(-6).toUpperCase()}</div>
+<hr/>
+${sale.items.filter(it=>!it.voided).map(it=>`<div class="r"><span>${it.name} x${it.qty}</span><span>${cur}${(it.price*it.qty).toFixed(2)}</span></div>`).join("")}
+<hr/>
+${sale.discount ? `<div class="r"><span>Discount</span><span>-${cur}${sale.discount.toFixed(2)}</span></div>` : ""}
+<div class="r b"><span>TOTAL</span><span>${cur}${sale.total.toFixed(2)}</span></div>
+<div class="r"><span>Paid (${sale.payMethod||"cash"})</span><span>${cur}${(sale.paid||sale.total).toFixed(2)}</span></div>
+${sale.change > 0 ? `<div class="r"><span>Change</span><span>${cur}${sale.change.toFixed(2)}</span></div>` : ""}
+<hr/>
+<div class="c">${payIcon[sale.payMethod]||"💵"} ${(sale.payMethod||"cash").toUpperCase()}</div>
+<hr/>
+<div class="c">Thank you! Visit again 🙏</div>
+<div class="c" style="margin-top:4px;font-size:10px">Powered by Masala Master POS</div>
+</body></html>`;
+}
+
+function printReceipt(sale, settings, cur) {
+  const w = window.open("","_blank","width=420,height=650");
+  if (!w) { alert("Pop-up blocked. Allow pop-ups and try again."); return; }
+  w.document.write(buildReceiptHTML(sale, settings, cur));
+  w.document.close();
+  setTimeout(() => { try { w.print(); } catch {} }, 400);
+}
+
+// ── Edit Order Modal ──
+function EditOrderModal({ sale, products, settings, onSave, onClose }) {
+  const cur = settings.currency;
+  const [items, setItems]       = useState(sale.items.map(it=>({...it, _voided: it.voided||false})));
+  const [discount, setDiscount] = useState(sale.discount||0);
+  const [note, setNote]         = useState(sale.note||"");
+  const subtotal = items.filter(it=>!it._voided).reduce((a,it)=>a+it.price*it.qty, 0);
+  const total    = Math.max(0, subtotal - discount);
+  function updItem(i, field, val) {
+    setItems(its => its.map((it,idx)=>idx===i?{...it,[field]:field==="qty"?Math.max(1,+val):+val}:it));
+  }
+  function voidItem(i) { setItems(its=>its.map((it,idx)=>idx===i?{...it,_voided:!it._voided}:it)); }
+  function save() {
+    onSave({...sale, items:items.map(({_voided,...it})=>({...it,voided:_voided})), discount, total, note, _edited:true, _editedAt:new Date().toISOString()});
+  }
+  return (
+    <div className="mo" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="md" style={{maxWidth:680}}>
+        <div className="mh"><h2>Edit Order #{sale.id.slice(-6).toUpperCase()}</h2><button className="bi" onClick={onClose}><I n="x" s={18}/></button></div>
+        <div className="mb">
+          <div style={{background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:8,padding:"10px 14px",fontSize:12.5,color:"#92400E",marginBottom:16}}>
+            ⚠️ Editing affects totals and reports. Voided items are crossed out on receipt.
+          </div>
+          <table style={{width:"100%",borderCollapse:"collapse",marginBottom:16}}>
+            <thead><tr style={{background:"var(--bg)"}}>
+              {["Item","Qty","Unit Price","Subtotal","Action"].map(h=>(
+                <th key={h} style={{padding:"8px 10px",fontSize:11,fontWeight:700,color:"var(--text2)",textAlign:"left",borderBottom:"1px solid var(--border)",textTransform:"uppercase"}}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {items.map((it,i)=>(
+                <tr key={i} style={{opacity:it._voided?.5:1,textDecoration:it._voided?"line-through":"none"}}>
+                  <td style={{fontSize:13.5,fontWeight:600}}>{it.name}</td>
+                  <td><input type="number" min="1" value={it.qty} onChange={e=>updItem(i,"qty",e.target.value)} disabled={it._voided} style={{width:60,padding:"5px 8px",border:"1.5px solid var(--border)",borderRadius:6,fontSize:13}}/></td>
+                  <td><input type="number" min="0" value={it.price} onChange={e=>updItem(i,"price",e.target.value)} disabled={it._voided} style={{width:80,padding:"5px 8px",border:"1.5px solid var(--border)",borderRadius:6,fontSize:13}}/></td>
+                  <td style={{fontWeight:600,color:it._voided?"#9CA3AF":"var(--accent)"}}>{cur}{(it.price*it.qty).toFixed(2)}</td>
+                  <td><button className={`bi bsm ${it._voided?"bs":"bd"}`} onClick={()=>voidItem(i)}>{it._voided?"↩ Restore":"✕ Void"}</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{display:"flex",gap:20,marginBottom:12,flexWrap:"wrap"}}>
+            <div className="fgg" style={{flex:1,minWidth:160}}>
+              <label>Discount ({cur})</label>
+              <input type="number" min="0" max={subtotal} value={discount} onChange={e=>setDiscount(Math.max(0,Math.min(subtotal,+e.target.value)))}/>
+            </div>
+            <div className="fgg" style={{flex:2,minWidth:200}}>
+              <label>Internal Note</label>
+              <input type="text" value={note} onChange={e=>setNote(e.target.value)} placeholder="Reason for edit…"/>
+            </div>
+          </div>
+          <div style={{background:"var(--bg)",borderRadius:10,padding:"14px 18px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{color:"var(--text2)",fontSize:13}}>Subtotal: {cur}{subtotal.toFixed(2)}{discount>0&&<span style={{color:"var(--accent)",marginLeft:8}}>− {cur}{discount.toFixed(2)}</span>}</div>
+            <div style={{fontSize:22,fontWeight:800,color:"var(--accent)"}}>New Total: {cur}{total.toFixed(2)}</div>
+          </div>
+        </div>
+        <div className="mf">
+          <button className="btn bs" onClick={onClose}>Cancel</button>
+          <button className="btn bp" onClick={save}><I n="check" s={15}/> Save Changes</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Dashboard ──
+function Dashboard({ db, onShowSale, newOrders, setNewOrders }) {
+  const { products, sales, settings } = db;
+  const cur = settings.currency;
+  const todaySales  = sales.filter(s=>new Date(s.date).toDateString()===today()&&!s.voided);
+  const todayRev    = todaySales.reduce((a,s)=>a+s.total, 0);
+  const todayProfit = todaySales.reduce((a,s)=>a+getProfit(s,products), 0);
+  const monthRev    = sales.filter(s=>Date.now()-new Date(s.date)<30*86400000&&!s.voided).reduce((a,s)=>a+s.total, 0);
+  const cashBalance = sales.filter(s=>s.payMethod==="cash"&&!s.voided).reduce((a,s)=>a+s.total,0);
+  const lowStock    = products.filter(p=>p.stock>0&&p.stock<=10);
+  const outStock    = products.filter(p=>p.stock===0);
+  const itemCount   = {};
+  sales.forEach(s=>s.items.filter(it=>!it.voided).forEach(it=>{itemCount[it.name]=(itemCount[it.name]||0)+it.qty;}));
+  const bestSellers = Object.entries(itemCount).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  const weekDays    = Array.from({length:7},(_,i)=>{
+    const d = new Date(Date.now()-(6-i)*86400000);
+    const rev = sales.filter(s=>new Date(s.date).toDateString()===d.toDateString()&&!s.voided).reduce((a,s)=>a+s.total,0);
+    return { label:d.toLocaleDateString("en",{weekday:"short"}), value:rev };
+  });
+  const maxRev = Math.max(...weekDays.map(d=>d.value), 1);
+
+  return (
+    <div>
+      {newOrders.length>0&&(
+        <div className="new-order-banner">
+          <div style={{fontSize:28}}>📱</div>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:800,fontSize:16}}>New Order{newOrders.length>1?"s":""} from iPhone!</div>
+            <div style={{fontSize:13,opacity:.9}}>{newOrders.length} order{newOrders.length>1?"s":""} · {cur}{newOrders.reduce((a,s)=>a+s.total,0).toFixed(0)} total</div>
+          </div>
+          <button className="btn" style={{background:"rgba(255,255,255,.2)",color:"#fff",border:"1px solid rgba(255,255,255,.35)"}}
+            onClick={()=>{ onShowSale(newOrders[0]); setNewOrders([]); }}>View →</button>
+          <button style={{background:"none",border:"none",color:"rgba(255,255,255,.7)",cursor:"pointer",fontSize:20,padding:"0 4px"}} onClick={()=>setNewOrders([])}>×</button>
+        </div>
+      )}
+      <div className="sgrid">
+        <SC label="Today's Revenue"  value={`${cur}${todayRev.toLocaleString()}`}           sub={`${todaySales.length} transactions`}   icon="💰" color="#C8392B"/>
+        <SC label="Today's Profit"   value={`${cur}${Math.round(todayProfit).toLocaleString()}`} sub={`${todayRev>0?((todayProfit/todayRev)*100).toFixed(1):0}% margin`} icon="📈" color="#2B7A3D"/>
+        <SC label="Monthly Revenue"  value={`${cur}${monthRev.toLocaleString()}`}           sub="Last 30 days"                          icon="📅" color="#E8A020"/>
+        <SC label="Cash Drawer"      value={`${cur}${cashBalance.toLocaleString()}`}        sub="Total cash received"                   icon="🏦" color="#7C3AED"/>
+      </div>
+      <div className="row">
+        <div className="c2">
+          <div className="card">
+            <div className="sh"><h2>Weekly Sales</h2><span className="badge by">Last 7 Days</span></div>
+            <div className="cbw">
+              {weekDays.map((d,i)=>(
+                <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                  <div className="cb" data-tip={`${cur}${d.value}`}
+                    style={{height:`${(d.value/maxRev)*100}%`,minHeight:d.value>0?6:2,background:"var(--accent)",opacity:d.value>0?1:.15}}/>
+                  <div className="cbl">{d.label}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="c1">
+          <div className="card" style={{height:"100%"}}>
+            <div className="sh"><h2>Best Sellers</h2></div>
+            {bestSellers.length===0 ? <p style={{color:"var(--text2)",fontSize:13}}>No data yet</p> :
+              bestSellers.map(([name,qty],i)=>(
+                <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:i<bestSellers.length-1?"1px solid var(--border)":"none"}}>
+                  <span style={{fontSize:13,fontWeight:500}}>{i+1}. {name}</span>
+                  <span className="badge bg">{qty} sold</span>
+                </div>
+              ))}
+          </div>
+        </div>
+      </div>
+      <div className="row">
+        <div className="c1">
+          <div className="card">
+            <div className="sh"><h2>⚠️ Low Stock</h2><span className="badge by">{lowStock.length}</span></div>
+            {lowStock.length===0 ? <p style={{color:"var(--text2)",fontSize:13}}>All stocked!</p> :
+              lowStock.map(p=>(
+                <div key={p.id} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:"1px solid var(--border)"}}>
+                  <span style={{fontSize:13}}>{p.image} {p.name}</span>
+                  <span className="badge by">{p.stock} left</span>
+                </div>
+              ))}
+          </div>
+        </div>
+        <div className="c1">
+          <div className="card">
+            <div className="sh"><h2>🔴 Out of Stock</h2><span className="badge br">{outStock.length}</span></div>
+            {outStock.length===0 ? <p style={{color:"var(--text2)",fontSize:13}}>All in stock!</p> :
+              outStock.map(p=>(
+                <div key={p.id} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:"1px solid var(--border)"}}>
+                  <span style={{fontSize:13}}>{p.image} {p.name}</span>
+                  <span className="badge br">Out</span>
+                </div>
+              ))}
+          </div>
+        </div>
+        <div className="c1">
+          <div className="card">
+            <div className="sh"><h2>📊 Payment Split</h2></div>
+            {[["cash","💵 Cash","#2B7A3D","bg"],["card","💳 Card","#1A56DB","bb"],["online","📱 Online","#7C3AED","bp_"]].map(([m,l,c])=>{
+              const rev = todaySales.filter(s=>s.payMethod===m).reduce((a,s)=>a+s.total,0);
+              const pct = todayRev>0?(rev/todayRev)*100:0;
+              return (
+                <div key={m} style={{marginBottom:12}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:13}}>
+                    <span style={{fontWeight:600}}>{l}</span>
+                    <span style={{fontWeight:700,color:c}}>{cur}{rev.toLocaleString()}</span>
+                  </div>
+                  <div className="prog"><div className="prog-bar" style={{width:`${pct}%`,background:c}}/></div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Inventory ──
+function Inventory({ db, setDb, showToast, syncSave }) {
+  const [search, setSearch] = useState("");
+  const [catF, setCatF]     = useState("All");
+  const [modal, setModal]   = useState(false);
+  const [editing, setEd]    = useState(null);
+  const [form, setForm]     = useState({});
+  const bRef = useRef(null);
+
+  const cats     = ["All", ...new Set(db.products.map(p=>p.category))];
+  const filtered = db.products.filter(p => {
+    const ms = p.name.toLowerCase().includes(search.toLowerCase())||p.barcode.includes(search)||p.code.includes(search);
+    return ms && (catF==="All"||p.category===catF);
+  });
+
+  function openAdd() { setEd(null); setForm({name:"",code:"",barcode:"",category:"Grains",price:"",cost:"",stock:"",unit:"Kg",supplier:"",tax:"5",image:"📦"}); setModal(true); }
+  function openEdit(p) { setEd(p.id); setForm({...p}); setModal(true); }
+
+  function save() {
+    if (!form.name||!form.barcode||!form.price) { showToast("Fill all required fields","error"); return; }
+    let products;
+    if (editing) {
+      products = db.products.map(p=>p.id===editing?{...form,id:editing,price:+form.price,cost:+form.cost,stock:+form.stock,tax:+form.tax}:p);
+      showToast("Product updated!","success");
+    } else {
+      if (db.products.find(p=>p.barcode===form.barcode)) { showToast("Barcode already exists","error"); return; }
+      products = [...db.products,{...form,id:"p"+Date.now(),price:+form.price,cost:+form.cost,stock:+form.stock,tax:+form.tax}];
+      showToast("Product added!","success");
+    }
+    syncSave({...db,products}); setModal(false);
+  }
+  function del(id) {
+    if (!confirm("Delete this product?")) return;
+    syncSave({...db,products:db.products.filter(p=>p.id!==id)});
+    showToast("Product deleted","warn");
+  }
+  function adj(id,delta) { syncSave({...db,products:db.products.map(p=>p.id===id?{...p,stock:Math.max(0,p.stock+delta)}:p)}); }
+
+  const SB = s => s===0 ? <span className="badge br">Out</span> : s<=10 ? <span className="badge by">{s}</span> : <span className="badge bg">{s}</span>;
+
+  function exportCSV() {
+    const rows = [["Code","Barcode","Name","Category","Cost","Price","Stock","Unit","Supplier","Tax%"]];
+    db.products.forEach(p=>rows.push([p.code,p.barcode,p.name,p.category,p.cost,p.price,p.stock,p.unit,p.supplier,p.tax]));
+    const a = document.createElement("a");
+    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(rows.map(r=>r.join(",")).join("\n"));
+    a.download = "masala-master-inventory.csv"; a.click();
+    showToast("Inventory exported","success");
+  }
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+        <div className="iw" style={{flex:1,minWidth:200}}>
+          <span className="ii"><I n="search" s={15}/></span>
+          <input placeholder="Search name, barcode, code…" value={search} onChange={e=>setSearch(e.target.value)}/>
+        </div>
+        <select value={catF} onChange={e=>setCatF(e.target.value)} style={{width:150}}>
+          {cats.map(c=><option key={c}>{c}</option>)}
+        </select>
+        <button className="btn bs" onClick={exportCSV}><I n="download" s={15}/> Export CSV</button>
+        <button className="btn bp" onClick={openAdd}><I n="plus" s={15}/> Add Product</button>
+      </div>
+      <div style={{marginBottom:12,fontSize:13,color:"var(--text2)"}}>{filtered.length} of {db.products.length} products</div>
+      <div className="tw">
+        <table>
+          <thead><tr><th>Product</th><th>Code</th><th>Barcode</th><th>Category</th><th>Cost</th><th>Price</th><th>Margin</th><th>Stock</th><th>Actions</th></tr></thead>
+          <tbody>
+            {filtered.map(p=>(
+              <tr key={p.id}>
+                <td>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:22}}>{p.image}</span>
+                    <div><div style={{fontWeight:600,fontSize:13.5}}>{p.name}</div><div style={{fontSize:11,color:"var(--text2)"}}>{p.unit} · {p.supplier}</div></div>
+                  </div>
+                </td>
+                <td><span className="tag">{p.code}</span></td>
+                <td style={{fontFamily:"monospace",fontSize:11.5,color:"var(--text2)"}}>{p.barcode}</td>
+                <td><span className="badge bg">{p.category}</span></td>
+                <td style={{color:"var(--text2)"}}>{db.settings.currency}{p.cost}</td>
+                <td style={{fontWeight:700,color:"var(--accent)"}}>{db.settings.currency}{p.price}</td>
+                <td style={{color:"#2B7A3D",fontWeight:600,fontSize:12}}>{p.price>0?((p.price-p.cost)/p.price*100).toFixed(1):0}%</td>
+                <td>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    {SB(p.stock)}
+                    <button className="bi" style={{padding:"2px 6px",fontSize:14}} onClick={()=>adj(p.id,-1)}>−</button>
+                    <button className="bi" style={{padding:"2px 6px",fontSize:14}} onClick={()=>adj(p.id,+1)}>+</button>
+                  </div>
+                </td>
+                <td>
+                  <div style={{display:"flex",gap:5}}>
+                    <button className="bi" onClick={()=>openEdit(p)}><I n="edit" s={14}/></button>
+                    <button className="bi bd" onClick={()=>del(p.id)}><I n="trash" s={14}/></button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {modal&&(
+        <div className="mo" onClick={e=>e.target===e.currentTarget&&setModal(false)}>
+          <div className="md">
+            <div className="mh"><h2>{editing?"Edit Product":"Add Product"}</h2><button className="bi" onClick={()=>setModal(false)}><I n="x" s={18}/></button></div>
+            <div className="mb">
+              <div style={{marginBottom:14,padding:"10px 14px",background:"#FFF8F0",border:"1px solid #FED7AA",borderRadius:8,fontSize:12.5,color:"#92400E"}}>
+                💡 Scan barcode or type it. Press Enter to jump to Name.
+              </div>
+              <div className="fg">
+                <div className="fgg"><label>Barcode *</label><div className="iw"><span className="ii"><I n="barcode" s={14}/></span><input ref={bRef} style={{paddingLeft:36}} placeholder="Scan or type barcode…" value={form.barcode||""} onChange={e=>setForm(f=>({...f,barcode:e.target.value}))} autoFocus/></div></div>
+                <div className="fgg"><label>Product Code *</label><input placeholder="e.g. 1001" value={form.code||""} onChange={e=>setForm(f=>({...f,code:e.target.value}))}/></div>
+                <div className="fgg full"><label>Product Name *</label><input placeholder="e.g. Basmati Rice 5kg" value={form.name||""} onChange={e=>setForm(f=>({...f,name:e.target.value}))}/></div>
+                <div className="fgg"><label>Category</label><select value={form.category||""} onChange={e=>setForm(f=>({...f,category:e.target.value}))}>{["Grains","Pulses","Dairy","Spices","Oils","Snacks","Beverages","Vegetables","Fruits","Other"].map(c=><option key={c}>{c}</option>)}</select></div>
+                <div className="fgg"><label>Unit</label><select value={form.unit||""} onChange={e=>setForm(f=>({...f,unit:e.target.value}))}>{["Kg","g","L","ml","Pack","Bag","Box","Bottle","Pouch","Piece"].map(u=><option key={u}>{u}</option>)}</select></div>
+                <div className="fgg"><label>Cost Price ({db.settings.currency}) *</label><input type="number" min="0" placeholder="0.00" value={form.cost||""} onChange={e=>setForm(f=>({...f,cost:e.target.value}))}/></div>
+                <div className="fgg"><label>Selling Price ({db.settings.currency}) *</label><input type="number" min="0" placeholder="0.00" value={form.price||""} onChange={e=>setForm(f=>({...f,price:e.target.value}))}/></div>
+                <div className="fgg"><label>Stock Qty</label><input type="number" min="0" placeholder="0" value={form.stock||""} onChange={e=>setForm(f=>({...f,stock:e.target.value}))}/></div>
+                <div className="fgg"><label>Tax Rate (%)</label><input type="number" min="0" max="100" placeholder="5" value={form.tax||""} onChange={e=>setForm(f=>({...f,tax:e.target.value}))}/></div>
+                <div className="fgg"><label>Supplier</label><input placeholder="Supplier name" value={form.supplier||""} onChange={e=>setForm(f=>({...f,supplier:e.target.value}))}/></div>
+                <div className="fgg"><label>Emoji Icon</label><input placeholder="🍚" value={form.image||""} onChange={e=>setForm(f=>({...f,image:e.target.value}))}/></div>
+              </div>
+            </div>
+            <div className="mf">
+              <button className="btn bs" onClick={()=>setModal(false)}>Cancel</button>
+              <button className="btn bp" onClick={save}><I n="check" s={15}/> {editing?"Save Changes":"Add Product"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sales History ──
+function SalesHistory({ db, syncSave, showToast }) {
+  const { sales, settings, products } = db;
+  const cur = settings.currency;
+  const [sel, setSel]         = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo]   = useState("");
+  const [searchQ, setSearchQ] = useState("");
+  const [payF, setPayF]       = useState("all");
+  const [sourceF, setSourceF] = useState("all");
+
+  const filtered = useMemo(() => {
+    return [...sales].reverse().filter(s => {
+      const d = new Date(s.date);
+      if (dateFrom && d < new Date(dateFrom)) return false;
+      if (dateTo   && d > new Date(dateTo+"T23:59:59")) return false;
+      if (payF!=="all" && s.payMethod!==payF) return false;
+      if (sourceF!=="all" && s.source!==sourceF) return false;
+      if (searchQ && !s.id.includes(searchQ) && !s.items.some(it=>it.name.toLowerCase().includes(searchQ.toLowerCase()))) return false;
+      return true;
+    });
+  }, [sales, dateFrom, dateTo, payF, sourceF, searchQ]);
+
+  const totalRev    = filtered.filter(s=>!s.voided).reduce((a,s)=>a+s.total, 0);
+  const totalProfit = filtered.filter(s=>!s.voided).reduce((a,s)=>a+getProfit(s,products), 0);
+
+  function voidSale(id) {
+    if (!confirm("Void this entire sale?")) return;
+    syncSave({...db, sales:db.sales.map(s=>s.id===id?{...s,voided:true,voidedAt:new Date().toISOString()}:s)});
+    setSel(null); showToast("Sale voided","warn");
+  }
+
+  function saveEdit(updated) {
+    syncSave({...db, sales:db.sales.map(s=>s.id===updated.id?updated:s)});
+    setEditing(null); showToast("Order updated","success");
+  }
+
+  function exportCSV() {
+    const rows = [["ID","Date","Cashier","Source","Items","Total","PayMethod","Paid","Change","Voided"]];
+    filtered.forEach(s=>rows.push([s.id,new Date(s.date).toLocaleString(),s.cashier,s.source||"desktop",s.items.length,s.total,s.payMethod||"cash",s.paid,s.change,s.voided?"YES":""]));
+    const a = document.createElement("a");
+    a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(rows.map(r=>r.join(",")).join("\n"));
+    a.download="masala-sales.csv"; a.click();
+    showToast("Sales exported","success");
+  }
+
+  const payIcon    = { cash:"💵", card:"💳", online:"📱" };
+  const sourceIcon = { iphone:"📱", desktop:"🖥️" };
+
+  return (
+    <div>
+      <div style={{background:"#fff",border:"1px solid var(--border)",borderRadius:"var(--r)",padding:"14px 18px",marginBottom:16}}>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+          <div className="iw" style={{flex:1,minWidth:180}}>
+            <span className="ii"><I n="search" s={14}/></span>
+            <input placeholder="Search orders…" value={searchQ} onChange={e=>setSearchQ(e.target.value)}/>
+          </div>
+          <input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)} style={{width:150}}/>
+          <input type="date" value={dateTo}   onChange={e=>setDateTo(e.target.value)}   style={{width:150}}/>
+          <select value={payF} onChange={e=>setPayF(e.target.value)} style={{width:130}}>
+            <option value="all">All Methods</option>
+            <option value="cash">💵 Cash</option>
+            <option value="card">💳 Card</option>
+            <option value="online">📱 Online</option>
+          </select>
+          <select value={sourceF} onChange={e=>setSourceF(e.target.value)} style={{width:130}}>
+            <option value="all">All Sources</option>
+            <option value="iphone">📱 iPhone</option>
+            <option value="desktop">🖥️ Desktop</option>
+          </select>
+          <button className="btn bs" onClick={()=>{setDateFrom("");setDateTo("");setPayF("all");setSourceF("all");setSearchQ("");}}>Clear</button>
+          <button className="btn bs" onClick={exportCSV}><I n="download" s={14}/> Export</button>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+        {[
+          ["Transactions", filtered.length],
+          ["Revenue", `${cur}${totalRev.toLocaleString()}`],
+          ["Profit", `${cur}${Math.round(totalProfit).toLocaleString()}`],
+          ["Avg Sale", `${cur}${filtered.filter(s=>!s.voided).length?Math.round(totalRev/filtered.filter(s=>!s.voided).length):0}`],
+        ].map(([l,v])=>(
+          <div key={l} className="card" style={{flex:1,minWidth:100,padding:"12px 16px"}}>
+            <div className="slabel" style={{fontSize:10}}>{l}</div>
+            <div className="sval" style={{fontSize:18}}>{v}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="tw">
+        <table>
+          <thead><tr><th>Order #</th><th>Date & Time</th><th>Source</th><th>Cashier</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody>
+            {filtered.map(s=>(
+              <tr key={s.id} style={{opacity:s.voided?.5:1}}>
+                <td><span className="tag">#{s.id.slice(-6).toUpperCase()}</span></td>
+                <td style={{fontSize:12.5,color:"var(--text2)"}}>{fmtDateShort(s.date)}</td>
+                <td style={{fontSize:13}}>{sourceIcon[s.source]||"🖥️"} {s.source||"desktop"}</td>
+                <td>{s.cashier}</td>
+                <td>{s.items.filter(it=>!it.voided).length} items</td>
+                <td style={{fontWeight:700,color:"var(--accent)"}}>{cur}{s.total.toFixed(2)}</td>
+                <td><span className="badge bg">{payIcon[s.payMethod]||"💵"} {s.payMethod||"cash"}</span></td>
+                <td>
+                  {s.voided ? <span className="badge br">Voided</span> : s._edited ? <span className="badge by">Edited</span> : <span className="badge bg">Paid</span>}
+                </td>
+                <td>
+                  <div style={{display:"flex",gap:5}}>
+                    <button className="bi bsm" onClick={()=>setSel(s)}><I n="receipt" s={13}/></button>
+                    <button className="bi bsm" onClick={()=>printReceipt(s,settings,cur)}><I n="print" s={13}/></button>
+                    {!s.voided&&<button className="bi bsm" onClick={()=>setEditing(s)}><I n="edit" s={13}/></button>}
+                    {!s.voided&&<button className="bi bsm bd" onClick={()=>voidSale(s.id)}><I n="void" s={13}/></button>}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {filtered.length===0&&<div style={{padding:"40px",textAlign:"center",color:"var(--text2)"}}>No sales match your filters</div>}
+      </div>
+
+      {sel&&(
+        <div className="mo" onClick={e=>e.target===e.currentTarget&&setSel(null)}>
+          <div className="md" style={{maxWidth:420}}>
+            <div className="mh"><h2>Receipt #{sel.id.slice(-6).toUpperCase()}</h2><button className="bi" onClick={()=>setSel(null)}><I n="x" s={18}/></button></div>
+            <div className="mb">
+              {sel.voided&&<div style={{background:"#FEF2F2",border:"1px solid #FECACA",borderRadius:8,padding:"10px 14px",marginBottom:12,color:"#991B1B",fontWeight:600,fontSize:13}}>⚠️ This sale has been voided</div>}
+              <div className="rp">
+                <div style={{textAlign:"center",marginBottom:8}}>
+                  <strong>{settings.storeName}</strong><br/>
+                  <span style={{fontSize:11}}>{settings.address}</span><br/>
+                  <span style={{fontSize:11}}>Tel: {settings.phone} · GSTIN: {settings.gstin}</span>
+                </div>
+                <hr/>
+                <div>Date: {new Date(sel.date).toLocaleString()}</div>
+                <div>Cashier: {sel.cashier} {sel.source==="iphone"?"📱":""}</div>
+                <div>Order: #{sel.id.slice(-6).toUpperCase()}</div>
+                <hr/>
+                {sel.items.map((it,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",textDecoration:it.voided?"line-through":"none",opacity:it.voided?.5:1}}>
+                    <span>{it.name} ×{it.qty}</span><span>{cur}{(it.price*it.qty).toFixed(2)}</span>
+                  </div>
+                ))}
+                <hr/>
+                {sel.discount>0&&<div style={{display:"flex",justifyContent:"space-between",color:"#C8392B"}}><span>Discount</span><span>-{cur}{sel.discount.toFixed(2)}</span></div>}
+                <div style={{display:"flex",justifyContent:"space-between",fontWeight:"bold"}}><span>TOTAL</span><span>{cur}{sel.total.toFixed(2)}</span></div>
+                <div style={{display:"flex",justifyContent:"space-between"}}><span>Paid ({sel.payMethod||"cash"})</span><span>{cur}{(sel.paid||sel.total).toFixed(2)}</span></div>
+                {sel.change>0&&<div style={{display:"flex",justifyContent:"space-between"}}><span>Change</span><span>{cur}{sel.change.toFixed(2)}</span></div>}
+                <hr/>
+                <div style={{textAlign:"center",fontSize:11}}>Thank you! Visit again 🙏</div>
+              </div>
+            </div>
+            <div className="mf">
+              <button className="btn bs" onClick={()=>setSel(null)}>Close</button>
+              <button className="btn bp" onClick={()=>printReceipt(sel,settings,cur)}><I n="print" s={14}/> Print</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editing&&<EditOrderModal sale={editing} products={products} settings={settings} onSave={saveEdit} onClose={()=>setEditing(null)}/>}
+    </div>
+  );
+}
+
+// ── Analytics ──
+function Analytics({ db }) {
+  const { products, sales, settings } = db;
+  const cur = settings.currency;
+  const [range, setRange] = useState("30");
+  const days = parseInt(range);
+  const filtered = sales.filter(s=>Date.now()-new Date(s.date)<days*86400000&&!s.voided);
+  const revenue  = filtered.reduce((a,s)=>a+s.total,0);
+  const profit   = filtered.reduce((a,s)=>a+getProfit(s,products),0);
+  const payBreak = {cash:0,card:0,online:0};
+  filtered.forEach(s=>{ if(payBreak[s.payMethod]!==undefined) payBreak[s.payMethod]+=s.total; });
+  const catRev   = {};
+  filtered.forEach(s=>s.items.filter(it=>!it.voided).forEach(it=>{
+    const p=products.find(pp=>pp.name===it.name);
+    catRev[p?.category||"Other"]=(catRev[p?.category||"Other"]||0)+it.price*it.qty;
+  }));
+  const catEntries = Object.entries(catRev).sort((a,b)=>b[1]-a[1]);
+  const maxCat     = Math.max(...catEntries.map(e=>e[1]),1);
+
+  const chartDays = Array.from({length:Math.min(days,30)},(_,i)=>{
+    const d=new Date(Date.now()-(Math.min(days,30)-1-i)*86400000);
+    const rev=filtered.filter(s=>new Date(s.date).toDateString()===d.toDateString()).reduce((a,s)=>a+s.total,0);
+    return {label:d.toLocaleDateString("en",{day:"numeric",month:"short"}),value:rev};
+  });
+  const maxChart = Math.max(...chartDays.map(d=>d.value),1);
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:10,marginBottom:20,alignItems:"center"}}>
+        <span style={{fontSize:13,fontWeight:600,color:"var(--text2)"}}>Time range:</span>
+        {[["7","7 Days"],["30","30 Days"],["90","3 Months"],["365","1 Year"]].map(([v,l])=>(
+          <button key={v} className={`btn ${range===v?"bp":"bs"}`} style={{padding:"6px 14px"}} onClick={()=>setRange(v)}>{l}</button>
+        ))}
+      </div>
+
+      <div className="sgrid">
+        <SC label="Total Revenue"   value={`${cur}${revenue.toLocaleString()}`}              sub={`${filtered.length} transactions`}                                  icon="💰" color="#C8392B"/>
+        <SC label="Total Profit"    value={`${cur}${Math.round(profit).toLocaleString()}`}    sub={`${revenue>0?((profit/revenue)*100).toFixed(1):0}% margin`}         icon="📈" color="#2B7A3D"/>
+        <SC label="Avg Order Value" value={`${cur}${filtered.length?Math.round(revenue/filtered.length):0}`} sub="Per transaction"                                    icon="🎯" color="#7C3AED"/>
+        <SC label="Daily Average"   value={`${cur}${Math.round(revenue/days)}`}              sub={`Over ${days} days`}                                                icon="📅" color="#E8A020"/>
+      </div>
+
+      <div className="row">
+        <div style={{flex:3}}>
+          <div className="card">
+            <div className="sh"><h2>Revenue Trend</h2><span className="badge by">Last {Math.min(days,30)} Days</span></div>
+            <div className="cbw">
+              {chartDays.map((d,i)=>(
+                <div key={i} style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center"}}>
+                  <div className="cb" data-tip={`${cur}${d.value}`}
+                    style={{height:`${(d.value/maxChart)*100}%`,minHeight:d.value>0?4:2,background:"var(--accent)",opacity:d.value>0?1:.12}}/>
+                  {i%5===0&&<div className="cbl">{d.label}</div>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div style={{flex:1}}>
+          <div className="card" style={{height:"100%"}}>
+            <div className="sh"><h2>Payment Mix</h2></div>
+            {Object.entries(payBreak).map(([m,v])=>{
+              const pct=revenue>0?(v/revenue)*100:0;
+              const colors={cash:"#2B7A3D",card:"#1A56DB",online:"#7C3AED"};
+              const icons ={cash:"💵",card:"💳",online:"📱"};
+              return (
+                <div key={m} style={{marginBottom:14}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:13}}>
+                    <span>{icons[m]} {m}</span><span style={{fontWeight:700}}>{pct.toFixed(0)}%</span>
+                  </div>
+                  <div className="prog"><div className="prog-bar" style={{width:`${pct}%`,background:colors[m]}}/></div>
+                  <div style={{fontSize:11,color:"var(--text2)",marginTop:2}}>{cur}{v.toLocaleString()}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="row">
+        <div className="c1">
+          <div className="card">
+            <div className="sh"><h2>Revenue by Category</h2></div>
+            {catEntries.length===0 ? <p style={{color:"var(--text2)"}}>No sales yet</p> :
+              catEntries.map(([cat,rev])=>(
+                <div key={cat} style={{marginBottom:12}}>
+                  <div style={{display:"flex",justifyContent:"space-between",marginBottom:4,fontSize:13}}>
+                    <span style={{fontWeight:600}}>{cat}</span>
+                    <span style={{color:"var(--accent)",fontWeight:700}}>{cur}{rev.toLocaleString()}</span>
+                  </div>
+                  <div className="prog"><div className="prog-bar" style={{width:`${(rev/maxCat)*100}%`,background:"var(--accent)"}}/></div>
+                </div>
+              ))}
+          </div>
+        </div>
+        <div className="c1">
+          <div className="card">
+            <div className="sh"><h2>Stock Health</h2></div>
+            {[["Healthy (>10)",products.filter(p=>p.stock>10).length,"bg"],["Low (1–10)",products.filter(p=>p.stock>0&&p.stock<=10).length,"by"],["Out of Stock",products.filter(p=>p.stock===0).length,"br"]].map(([l,c,cls])=>(
+              <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"8px 0",borderBottom:"1px solid var(--border)",fontSize:13}}>
+                <span>{l}</span><span className={`badge ${cls}`}>{c} products</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Settings ──
+function Settings({ db, syncSave, showToast, syncStatus, lastSyncTime, fbConnected, onTestSync }) {
+  const [form, setForm] = useState({...db.settings});
+  const [testing, setTesting] = useState(false);
+
+  function save() {
+    const nd = {...db, settings:{...form}};
+    syncSave(nd);
+    if (form.firebaseConfig !== db.settings.firebaseConfig) {
+      window.location.reload(); // re-init Firebase cleanly
+    }
+    showToast("Settings saved & synced!","success");
+  }
+
+  function reset() {
+    if (!confirm("Reset ALL data? This cannot be undone.")) return;
+    localStorage.clear(); location.reload();
+  }
+
+  function doTest() {
+    setTesting(true);
+    onTestSync();
+    setTimeout(()=>setTesting(false),3000);
+    showToast("Test ping sent — check iPhone for sync","info");
+  }
+
+  const syncColors = { connected:"#22C55E", syncing:"#E8A020", error:"#C8392B", offline:"#9CA3AF", idle:"#6B7280" };
+
+  return (
+    <div style={{maxWidth:700}}>
+      <div className="card" style={{marginBottom:16}}>
+        <h3 style={{fontFamily:"Syne",fontWeight:700,marginBottom:18,fontSize:17}}>Store Settings</h3>
+        <div className="fg">
+          {[["full","Store Name","storeName"],["full","Address","address"],["","Phone","phone"],["","GSTIN","gstin"],["","Default Cashier","cashier"],["","Currency Symbol","currency"]].map(([cls,lbl,key])=>(
+            <div key={key} className={`fgg ${cls}`}>
+              <label>{lbl}</label>
+              <input value={form[key]||""} onChange={e=>setForm(f=>({...f,[key]:e.target.value}))}/>
+            </div>
+          ))}
+        </div>
+        <div style={{marginTop:16,display:"flex",gap:10,flexWrap:"wrap",alignItems:"center"}}>
+          <button className="btn bp" onClick={save}><I n="check" s={14}/> Save Settings</button>
+          <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,fontWeight:500,cursor:"pointer"}}>
+            <input type="checkbox" checked={form.autoOpenOrders||false} onChange={e=>setForm(f=>({...f,autoOpenOrders:e.target.checked}))} style={{width:"auto"}}/>
+            Auto-open new iPhone orders
+          </label>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <h3 style={{fontFamily:"Syne",fontWeight:700,marginBottom:6,fontSize:17}}>🔄 Real-Time Sync</h3>
+        <p style={{fontSize:13,color:"var(--text2)",marginBottom:16}}>
+          Firebase Realtime Database powers instant cross-device sync. Both apps need the same Firebase config.
+        </p>
+
+        <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
+          <div className="card" style={{flex:1,padding:"12px 16px",boxShadow:"none",border:"1px solid var(--border)"}}>
+            <div className="slabel" style={{fontSize:10}}>Connection</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginTop:4}}>
+              <div style={{width:10,height:10,borderRadius:"50%",background:syncColors[syncStatus],animation:syncStatus==="connected"?"pulse 3s infinite":syncStatus==="syncing"?"pulse .7s infinite":"none"}}/>
+              <span style={{fontWeight:700,fontSize:14,textTransform:"capitalize"}}>{syncStatus==="connected"?"Live ✓":syncStatus}</span>
+            </div>
+          </div>
+          <div className="card" style={{flex:1,padding:"12px 16px",boxShadow:"none",border:"1px solid var(--border)"}}>
+            <div className="slabel" style={{fontSize:10}}>Firebase</div>
+            <div style={{fontWeight:700,fontSize:13,marginTop:4,color:fbConnected?"#166534":"#991B1B"}}>{fbConnected?"Connected 🟢":"Not connected 🔴"}</div>
+          </div>
+          <div className="card" style={{flex:1,padding:"12px 16px",boxShadow:"none",border:"1px solid var(--border)"}}>
+            <div className="slabel" style={{fontSize:10}}>Last Sync</div>
+            <div style={{fontWeight:700,fontSize:12,marginTop:4}}>{lastSyncTime ? new Date(lastSyncTime).toLocaleTimeString() : "N/A"}</div>
+          </div>
+        </div>
+
+        <div style={{background:"#EFF6FF",border:"1px solid #BFDBFE",borderRadius:8,padding:"12px 16px",marginBottom:14,fontSize:13}}>
+          <strong>📋 How to set up Firebase (free):</strong><br/>
+          1. Go to <a href="https://console.firebase.google.com" target="_blank" style={{color:"#1A56DB"}}>console.firebase.google.com</a><br/>
+          2. Create project → Build → Realtime Database → Create database → Start in test mode<br/>
+          3. Project Settings (⚙️) → Add app (Web) → Copy the config JSON → Paste below<br/>
+          4. Paste the <strong>same config</strong> in both Desktop and iPhone apps → Save
+        </div>
+
+        <div className="fgg" style={{marginBottom:14}}>
+          <label>Firebase Config JSON</label>
+          <textarea rows={6} value={form.firebaseConfig||""} onChange={e=>setForm(f=>({...f,firebaseConfig:e.target.value}))}
+            placeholder={`{\n  "apiKey": "AIzaSy...",\n  "authDomain": "your-app.firebaseapp.com",\n  "databaseURL": "https://your-app-default-rtdb.firebaseio.com",\n  "projectId": "your-app"\n}`}
+            style={{fontFamily:"monospace",fontSize:12,resize:"vertical"}}/>
+        </div>
+        <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+          <button className="btn bp" onClick={save}><I n="check" s={14}/> Save & Apply Config</button>
+          <button className="btn bs" onClick={doTest} disabled={testing}><I n="sync" s={14}/> {testing?"Testing…":"Test Connection"}</button>
+        </div>
+      </div>
+
+      <div className="card" style={{marginBottom:16}}>
+        <h3 style={{fontFamily:"Syne",fontWeight:700,marginBottom:16,fontSize:17}}>🖨️ Printer Settings</h3>
+        <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+          {[["58mm","58mm Thermal"],["80mm","80mm Thermal"],["A4","A4 Paper"]].map(([v,l])=>(
+            <label key={v} style={{display:"flex",alignItems:"center",gap:8,padding:"10px 16px",border:`2px solid ${form.thermalWidth===v?"var(--accent)":"var(--border)"}`,borderRadius:8,cursor:"pointer",fontSize:13,fontWeight:600,background:form.thermalWidth===v?"#FFF0EE":"#fff"}}>
+              <input type="radio" name="tw" value={v} checked={form.thermalWidth===v} onChange={e=>setForm(f=>({...f,thermalWidth:e.target.value}))} style={{width:"auto"}}/>{l}
+            </label>
+          ))}
+        </div>
+        <div style={{marginTop:12}}>
+          <button className="btn bs" onClick={save}><I n="check" s={14}/> Save</button>
+        </div>
+      </div>
+
+      <div className="card" style={{border:"1.5px solid #FECACA"}}>
+        <h3 style={{fontFamily:"Syne",fontWeight:700,marginBottom:8,color:"var(--accent)",fontSize:17}}>⚠️ Danger Zone</h3>
+        <p style={{fontSize:13,color:"var(--text2)",marginBottom:14}}>Permanently deletes all data. Cannot be undone.</p>
+        <button className="btn bd" onClick={reset}><I n="trash" s={14}/> Reset All Data</button>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════════════
+//  SYNC MANAGER HOOK — Production Real-Time Engine
+// ════════════════════════════════════════════════════════════
+function useSyncManager(db, setDb, setNewOrders, showToast) {
+  const [syncStatus, setSyncStatus]     = useState("idle");
+  const [fbConnected, setFbConnected]   = useState(false);
+  const [lastSyncTime, setLastSyncTime] = useState(null);
+  const dbRef       = useRef(db);
+  const seenSaleIds = useRef(new Set(db.sales.map(s=>s.id)));
+  dbRef.current     = db;
+
+  // Called on every db save — writes to localStorage + Firebase
+  function syncSave(newDb) {
+    newDb._lastUpdated = Date.now();
+    newDb._lastDevice  = DEVICE_ID;
+    saveLocalDB(newDb);
+    setDb(newDb);
+    if (FB.db) {
+      try { FB.db.ref(DB_PATH).set(newDb); } catch {}
+    }
+    // Broadcast to same-browser tabs
+    try { new BroadcastChannel(SYNC_CH).postMessage({type:"db",db:newDb,from:DEVICE_ID}); } catch {}
+    setLastSyncTime(Date.now());
+  }
+
+  // Merge incoming DB (products + settings only, not sales — those come via orders node)
+  function mergeRemoteDB(remote) {
+    const local = dbRef.current;
+    if (!remote || remote._lastDevice === DEVICE_ID) return;
+
+    // Merge sales with dedup
+    const newSales = (remote.sales||[]).filter(s => !seenSaleIds.current.has(s.id));
+    newSales.forEach(s => seenSaleIds.current.add(s.id));
+
+    const merged = {
+      ...local,
+      products: remote.products || local.products,
+      settings: local.settings, // Desktop always wins settings
+      sales: [...local.sales, ...newSales],
+      _lastUpdated: Date.now(),
+      _lastDevice: DEVICE_ID,
+    };
+    saveLocalDB(merged);
+    setDb(merged);
+    setLastSyncTime(Date.now());
+    setSyncStatus("connected");
+
+    if (newSales.length > 0) {
+      const iphoneOrders = newSales.filter(s=>s.source==="iphone");
+      if (iphoneOrders.length > 0) {
+        setNewOrders(prev=>[...prev,...iphoneOrders]);
+        showToast(`📱 ${iphoneOrders.length} new order${iphoneOrders.length>1?"s":""} from iPhone!`,"success");
+      }
+    }
+  }
+
+  // Handle individual order from orders node (fastest path)
+  function receiveOrder(order, key) {
+    if (!order || seenSaleIds.current.has(order.id)) {
+      // Already processed — just ack
+      if (key) fbAckOrder(key);
+      return;
+    }
+    seenSaleIds.current.add(order.id);
+
+    const local = dbRef.current;
+    const merged = {
+      ...local,
+      products: order._products || local.products, // iPhone may send updated stock
+      sales: [...local.sales, order],
+      _lastUpdated: Date.now(),
+      _lastDevice: DEVICE_ID,
+    };
+    saveLocalDB(merged);
+    setDb(merged);
+    setLastSyncTime(Date.now());
+    setSyncStatus("connected");
+
+    setNewOrders(prev=>[...prev, order]);
+    showToast(`📱 New order from iPhone! ${local.settings?.currency||"₹"}${order.total?.toFixed(0)}`, "success");
+
+    // Auto-navigate to Sales if enabled
+    if (local.settings?.autoOpenOrders) {
+      window._mmAutoOpenSales?.();
+    }
+
+    // Acknowledge — remove from queue
+    if (key) fbAckOrder(key);
+  }
+
+  useEffect(() => {
+    // ── BroadcastChannel (same browser, zero latency) ──
+    let bc;
+    try {
+      bc = new BroadcastChannel(SYNC_CH);
+      bc.onmessage = (e) => {
+        if (!e.data || e.data.from === DEVICE_ID) return;
+        if (e.data.type === "db")    mergeRemoteDB(e.data.db);
+        if (e.data.type === "order") receiveOrder(e.data.order, null);
+      };
+    } catch {}
+
+    // ── Online/Offline ──
+    const onOnline  = () => { setSyncStatus("connected"); setFbConnected(true); };
+    const onOffline = () => { setSyncStatus("offline"); setFbConnected(false); };
+    window.addEventListener("online",  onOnline);
+    window.addEventListener("offline", onOffline);
+
+    // ── Firebase ──
+    const cfg = db.settings?.firebaseConfig;
+    if (cfg?.trim()) {
+      setSyncStatus("syncing");
+      initFirebase(cfg, {
+        onNewOrder:   receiveOrder,
+        onRemoteDB:   mergeRemoteDB,
+        onConnected:  (connected) => {
+          setFbConnected(connected);
+          setSyncStatus(connected ? "connected" : "offline");
+          if (connected) setLastSyncTime(Date.now());
+        },
+      });
+    }
+
+    // ── Retry Firebase init if SDK loads late ──
+    const retryTimer = setInterval(() => {
+      if (!FB.initialized && db.settings?.firebaseConfig) {
+        initFirebase(db.settings.firebaseConfig, {
+          onNewOrder:   receiveOrder,
+          onRemoteDB:   mergeRemoteDB,
+          onConnected:  (c) => { setFbConnected(c); setSyncStatus(c?"connected":"offline"); },
+        });
+      }
+    }, 3000);
+
+    // ── Storage event (cross-tab fallback) ──
+    const onStorage = (e) => {
+      if (e.key !== STORE_KEY) return;
+      try {
+        const remote = JSON.parse(e.newValue);
+        if (remote?._lastDevice !== DEVICE_ID) mergeRemoteDB(remote);
+      } catch {}
+    };
+    window.addEventListener("storage", onStorage);
+
+    // Initial status
+    if (!navigator.onLine) setSyncStatus("offline");
+
+    return () => {
+      bc?.close();
+      clearInterval(retryTimer);
+      window.removeEventListener("online",  onOnline);
+      window.removeEventListener("offline", onOffline);
+      window.removeEventListener("storage", onStorage);
+      detachListeners();
+    };
+  }, []);
+
+  return { syncStatus, fbConnected, lastSyncTime, syncSave };
+}
+
+// ── App Root ──
+function App() {
+  const [db, setDb]         = useState(()=>initDB());
+  const [tab, setTab]       = useState("dashboard");
+  const [toasts, setToasts] = useState([]);
+  const [time, setTime]     = useState(new Date());
+  const [newOrders, setNewOrders] = useState([]);
+
+  function showToast(msg, type="success") {
+    const id = Date.now();
+    setToasts(ts=>[...ts,{id,msg,type}]);
+    setTimeout(()=>setToasts(ts=>ts.filter(t=>t.id!==id)), 5000);
+  }
+
+  const { syncStatus, fbConnected, lastSyncTime, syncSave } = useSyncManager(db, setDb, setNewOrders, showToast);
+
+  // Register auto-navigate hook for incoming orders
+  useEffect(() => {
+    window._mmAutoOpenSales = () => setTab("sales");
+    return () => { delete window._mmAutoOpenSales; };
+  }, []);
+
+  useEffect(()=>{ const t=setInterval(()=>setTime(new Date()),1000); return ()=>clearInterval(t); },[]);
+
+  // Auto-open sales when new iPhone orders arrive
+  useEffect(() => {
+    if (newOrders.length > 0 && db.settings?.autoOpenOrders) setTab("sales");
+  }, [newOrders.length]);
+
+  const low = db.products.filter(p=>p.stock>0&&p.stock<=10).length;
+  const out = db.products.filter(p=>p.stock===0).length;
+
+  const syncColors = { connected:"#22C55E", syncing:"#E8A020", error:"#C8392B", offline:"#6B7280", idle:"#6B7280" };
+  const syncLabels = { connected:"Live", syncing:"Syncing…", error:"Error", offline:"Offline", idle:"Local" };
+
+  const nav = [
+    {id:"dashboard",n:"dashboard",l:"Dashboard"},
+    {id:"inventory",n:"inventory",l:"Inventory"},
+    {id:"sales",n:"sales",l:"Sales History"},
+    {id:"analytics",n:"analytics",l:"Analytics"},
+    {id:"settings",n:"settings",l:"Settings"},
+  ];
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <aside className="sidebar">
+          <div className="sl">
+            <div style={{fontSize:28,marginBottom:4}}>🌶️</div>
+            <h1>Masala Master</h1>
+            <small>POS & Admin System</small>
+            <button className="sync-pill" onClick={()=>setTab("settings")} style={{color:syncColors[syncStatus]}}>
+              <div className={`sdot ${syncStatus}`}/>
+              <span>{syncLabels[syncStatus]}</span>
+              {fbConnected && <span style={{marginLeft:"auto",fontSize:10,opacity:.6}}>Firebase ✓</span>}
+            </button>
+          </div>
+
+          <nav className="snav">
+            <div className="nsec">Main</div>
+            {nav.map(item=>(
+              <div key={item.id} className={`ni${tab===item.id?" active":""}`} onClick={()=>setTab(item.id)}>
+                <I n={item.n} s={17}/>{item.l}
+                {item.id==="inventory" && out>0 && <span className="nbadge">{out}</span>}
+                {item.id==="sales" && newOrders.length>0 && <span className="nbadge new">{newOrders.length}</span>}
+              </div>
+            ))}
+          </nav>
+
+          <div style={{padding:"12px 16px",borderTop:"1px solid rgba(255,255,255,.07)",fontSize:11,color:"#4B3E2F"}}>
+            <div>{db.products.length} products · {db.sales.length} sales</div>
+            <div style={{marginTop:3}}>v3.0 · Real-Time Sync</div>
+          </div>
+        </aside>
+
+        <main className="main">
+          <div className="topbar">
+            <div className="tt">{{dashboard:"Dashboard",inventory:"Inventory",sales:"Sales History",analytics:"Analytics",settings:"Settings"}[tab]}</div>
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              {newOrders.length>0&&(
+                <button className="btn" style={{background:"#C8392B",color:"#fff",animation:"nbounce .4s ease"}}
+                  onClick={()=>{setTab("sales");setNewOrders([]);}}>
+                  📱 {newOrders.length} New Order{newOrders.length>1?"s":""}
+                </button>
+              )}
+              {low>0&&<div style={{display:"flex",alignItems:"center",gap:5,background:"#FFFBEB",border:"1px solid #FDE68A",borderRadius:8,padding:"5px 10px",fontSize:12.5,color:"#92400E",cursor:"pointer"}} onClick={()=>setTab("inventory")}>⚠️ {low} low stock</div>}
+              <div style={{fontSize:12.5,color:"var(--text2)",fontWeight:500}}>
+                {time.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:5,background:navigator.onLine?"#DCFCE7":"#FEF2F2",border:`1px solid ${navigator.onLine?"#BBF7D0":"#FECACA"}`,borderRadius:8,padding:"5px 10px",fontSize:12.5,color:navigator.onLine?"#166534":"#991B1B"}}>
+                <div style={{width:6,height:6,borderRadius:"50%",background:navigator.onLine?"#22C55E":"#C8392B"}}/>
+                {navigator.onLine?"Online":"Offline"}
+              </div>
+            </div>
+          </div>
+
+          <div className="content">
+            {tab==="dashboard"  && <Dashboard  db={db} onShowSale={s=>{setTab("sales");}} newOrders={newOrders} setNewOrders={setNewOrders}/>}
+            {tab==="inventory"  && <Inventory  db={db} setDb={setDb} showToast={showToast} syncSave={syncSave}/>}
+            {tab==="sales"      && <SalesHistory db={db} syncSave={syncSave} showToast={showToast}/>}
+            {tab==="analytics"  && <Analytics  db={db}/>}
+            {tab==="settings"   && <Settings   db={db} syncSave={syncSave} showToast={showToast} syncStatus={syncStatus} lastSyncTime={lastSyncTime} fbConnected={fbConnected} onTestSync={()=>{ if(FB.db) try{FB.db.ref("masalamaster/ping").set({from:DEVICE_ID,t:Date.now()});}catch{} }}/>}
+          </div>
+        </main>
+      </div>
+
+      {toasts.map(t=><Toast key={t.id} msg={t.msg} type={t.type} onClose={()=>setToasts(ts=>ts.filter(x=>x.id!==t.id))}/>)}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
